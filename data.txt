@@ -1,0 +1,500 @@
+<?php
+// تفعيل التقارير عن الأخطاء
+error_reporting(E_ALL);
+ini_set('display_errors', 1);
+
+// دالة لتسجيل الأخطاء
+function logError($message) {
+    $logFile = 'error_log.txt';
+    $timestamp = date('Y-m-d H:i:s');
+    file_put_contents($logFile, "[$timestamp] $message\n", FILE_APPEND);
+}
+
+$dataFile = "data.json";
+$uploadDir = "uploads/";
+
+// تحميل بيانات المرضى مع معالجة الأخطاء
+if (file_exists($dataFile)) {
+    $content = file_get_contents($dataFile);
+    if ($content === false) {
+        die(json_encode(['status' => 'error', 'message' => '❌ لا يمكن قراءة ملف البيانات']));
+    }
+    $patients = json_decode($content, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        die(json_encode(['status' => 'error', 'message' => '❌ ملف البيانات تالف: '.json_last_error_msg()]));
+    }
+    
+    // فرز المرضى حسب تاريخ الإضافة (الأحدث أولاً)
+    usort($patients, function($a, $b) {
+        $dateA = isset($a['added_date']) ? strtotime($a['added_date']) : 0;
+        $dateB = isset($b['added_date']) ? strtotime($b['added_date']) : 0;
+        return $dateB - $dateA;
+    });
+} else {
+    $patients = [];
+}
+
+$message = "";
+$editMode = false;
+$patientToEdit = null;
+$searchQuery = "";
+
+// معالجة طلب البحث
+if (isset($_GET['search'])) {
+    $searchQuery = trim($_GET['search']);
+}
+
+// معالجة طلب حذف المريض
+if (isset($_GET['delete_patient'])) {
+    try {
+        $phoneToDelete = $_GET['delete_patient'];
+        $found = false;
+        
+        foreach ($patients as $index => $patient) {
+            if ($patient['phone'] === $phoneToDelete) {
+                // حذف ملفات PDF المرتبطة بالمريض أولاً
+                foreach ($patient['tests'] as $test) {
+                    if (file_exists($test['file'])) {
+                        if (!unlink($test['file'])) {
+                            logError("Failed to delete file: " . $test['file']);
+                        }
+                    }
+                }
+                // حذف المريض من المصفوفة
+                unset($patients[$index]);
+                $found = true;
+                break;
+            }
+        }
+        
+        if ($found) {
+            // إعادة ترقيم المصفوفة
+            $patients = array_values($patients);
+            // حفظ التغييرات
+            if (file_put_contents($dataFile, json_encode($patients, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE))) {
+                echo json_encode(['status' => 'success', 'message' => '✅ تم حذف المريض بنجاح']);
+            } else {
+                logError("Failed to save data after deletion");
+                echo json_encode(['status' => 'error', 'message' => '❌ فشل في حفظ البيانات بعد الحذف']);
+            }
+        } else {
+            echo json_encode(['status' => 'error', 'message' => '❌ لم يتم العثور على المريض']);
+        }
+        exit();
+    } catch (Exception $e) {
+        logError("Delete patient error: " . $e->getMessage());
+        echo json_encode(['status' => 'error', 'message' => '❌ حدث خطأ أثناء حذف المريض']);
+        exit();
+    }
+}
+
+// معالجة طلب حذف ملف معين
+if (isset($_GET['delete_file'])) {
+    try {
+        $phone = $_GET['phone'];
+        $fileToDelete = $_GET['delete_file'];
+        $found = false;
+        
+        foreach ($patients as &$patient) {
+            if ($patient['phone'] === $phone) {
+                foreach ($patient['tests'] as $index => $test) {
+                    if ($test['file'] === $fileToDelete) {
+                        // حذف الملف الفعلي من السيرفر
+                        if (file_exists($fileToDelete)) {
+                            if (!unlink($fileToDelete)) {
+                                logError("Failed to delete file: " . $fileToDelete);
+                            }
+                        }
+                        // حذف الملف من مصفوفة الاختبارات
+                        unset($patient['tests'][$index]);
+                        // إعادة ترقيم المصفوفة
+                        $patient['tests'] = array_values($patient['tests']);
+                        $found = true;
+                        break 2;
+                    }
+                }
+            }
+        }
+        
+        if ($found) {
+            // حفظ التغييرات
+            if (file_put_contents($dataFile, json_encode($patients, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE))) {
+                echo json_encode(['status' => 'success', 'message' => '✅ تم حذف الملف بنجاح']);
+            } else {
+                logError("Failed to save data after file deletion");
+                echo json_encode(['status' => 'error', 'message' => '❌ فشل في حفظ البيانات بعد حذف الملف']);
+            }
+        } else {
+            echo json_encode(['status' => 'error', 'message' => '❌ لم يتم العثور على الملف']);
+        }
+        exit();
+    } catch (Exception $e) {
+        logError("Delete file error: " . $e->getMessage());
+        echo json_encode(['status' => 'error', 'message' => '❌ حدث خطأ أثناء حذف الملف']);
+        exit();
+    }
+}
+
+// معالجة طلب تعديل المريض
+if (isset($_GET['edit_patient'])) {
+    $phoneToEdit = $_GET['edit_patient'];
+    foreach ($patients as $patient) {
+        if ($patient['phone'] === $phoneToEdit) {
+            $patientToEdit = $patient;
+            $editMode = true;
+            break;
+        }
+    }
+}
+
+// معالجة طلب تحديث حالة الدفع
+if (isset($_GET['toggle_payment'])) {
+    try {
+        $phone = $_GET['toggle_payment'];
+        $found = false;
+        
+        foreach ($patients as &$patient) {
+            if ($patient['phone'] === $phone) {
+                $patient['is_paid'] = !$patient['is_paid'];
+                $newStatus = $patient['is_paid'];
+                $found = true;
+                break;
+            }
+        }
+        
+        if ($found) {
+            if (file_put_contents($dataFile, json_encode($patients, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE))) {
+                echo json_encode([
+                    'status' => 'success', 
+                    'message' => '✅ تم تحديث حالة الدفع',
+                    'is_paid' => $newStatus,
+                    'new_text' => $newStatus ? 'إلغاء الدفع' : 'تم الدفع',
+                    'new_class' => $newStatus ? 'btn-warning' : 'btn-success'
+                ]);
+            } else {
+                logError("Failed to save payment status");
+                echo json_encode(['status' => 'error', 'message' => '❌ فشل في حفظ حالة الدفع']);
+            }
+        } else {
+            echo json_encode(['status' => 'error', 'message' => '❌ لم يتم العثور على المريض']);
+        }
+        exit();
+    } catch (Exception $e) {
+        logError("Toggle payment error: " . $e->getMessage());
+        echo json_encode(['status' => 'error', 'message' => '❌ حدث خطأ أثناء تحديث حالة الدفع']);
+        exit();
+    }
+}
+
+// دالة لإضافة رمز الدولة إذا لم يكن موجوداً
+function formatPhoneNumber($phone) {
+    try {
+        $phone = preg_replace('/[^0-9]/', '', $phone);
+        
+        if (empty($phone)) {
+            return '';
+        }
+        
+        // إذا بدأ الرقم بـ 0، نستبدلها بـ +20
+        if (substr($phone, 0, 1) === '0') {
+            $phone = '+20' . substr($phone, 1);
+        }
+        // إذا كان الرقم يبدأ بـ 20 بدون +، نضيف +
+        elseif (substr($phone, 0, 2) === '20') {
+            $phone = '+' . $phone;
+        }
+        // إذا لم يكن هناك رمز دولة مطلقاً، نضيف +20
+        elseif (substr($phone, 0, 1) !== '+') {
+            $phone = '+20' . $phone;
+        }
+        
+        return $phone;
+    } catch (Exception $e) {
+        logError("Format phone error: " . $e->getMessage());
+        return $phone;
+    }
+}
+
+// معالجة طلب إرسال عبر الواتساب
+if (isset($_GET['send_whatsapp'])) {
+    try {
+        $phone = $_GET['send_whatsapp'];
+        $patient = null;
+        
+        foreach ($patients as $p) {
+            if ($p['phone'] === $phone) {
+                $patient = $p;
+                break;
+            }
+        }
+        
+        if ($patient) {
+            $whatsappNumber = formatPhoneNumber($patient['phone']);
+            // تغيير رسالة الواتساب هنا إلى النص المطلوب
+            $message = "السلام عليكم ورحمه الله وبركاته\nتم الانتهاء من التحاليل الطبية الخاصة بكم\nمعمل الايمان يتمنى لكم دوام الصحة والعافية\nيومكم سعيد 🌸🌹🌸";
+            $whatsappUrl = "https://wa.me/$whatsappNumber?text=" . urlencode($message);
+            echo json_encode(['status' => 'redirect', 'url' => $whatsappUrl]);
+        } else {
+            echo json_encode(['status' => 'error', 'message' => '❌ لم يتم العثور على المريض']);
+        }
+        exit();
+    } catch (Exception $e) {
+        logError("Whatsapp send error: " . $e->getMessage());
+        echo json_encode(['status' => 'error', 'message' => '❌ حدث خطأ أثناء إرسال واتساب']);
+        exit();
+    }
+}
+
+// معالجة طلب إرسال SMS
+if (isset($_GET['send_sms'])) {
+    try {
+        $phone = $_GET['send_sms'];
+        $patient = null;
+        $found = false;
+        
+        foreach ($patients as $p) {
+            if ($p['phone'] === $phone) {
+                $patient = $p;
+                break;
+            }
+        }
+        
+        if ($patient) {
+            $smsMessage = "عميلنا العزيز برجاء التوجه الى المعمل لاستلام النتائج أو الدخول الى ال Mobile App الخاص بالمعمل وتسجيل الدخول لرؤية النتائج الخاصه بك";
+            
+            foreach ($patients as &$p) {
+                if ($p['phone'] === $phone) {
+                    $p['sms_message'] = $smsMessage;
+                    $p['send_sms'] = true;
+                    $found = true;
+                    break;
+                }
+            }
+            
+            if ($found) {
+                if (file_put_contents($dataFile, json_encode($patients, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE))) {
+                    echo json_encode(['status' => 'success', 'message' => '✅ تم إعداد رسالة SMS للارسال: ' . $smsMessage]);
+                } else {
+                    logError("Failed to save SMS data");
+                    echo json_encode(['status' => 'error', 'message' => '❌ فشل في حفظ بيانات SMS']);
+                }
+            }
+        } else {
+            echo json_encode(['status' => 'error', 'message' => '❌ لم يتم العثور على المريض']);
+        }
+        exit();
+    } catch (Exception $e) {
+        logError("SMS send error: " . $e->getMessage());
+        echo json_encode(['status' => 'error', 'message' => '❌ حدث خطأ أثناء إرسال SMS']);
+        exit();
+    }
+}
+
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+    try {
+        // التحقق من وجود مجلد التحميل
+        if (!is_dir($uploadDir)) {
+            if (!mkdir($uploadDir, 0777, true)) {
+                echo json_encode(['status' => 'error', 'message' => '❌ لا يمكن إنشاء مجلد التحميل']);
+                exit();
+            }
+        }
+
+        if (!is_writable($uploadDir)) {
+            echo json_encode(['status' => 'error', 'message' => '❌ مجلد التحميل غير قابل للكتابة']);
+            exit();
+        }
+
+        $isPaid = isset($_POST["is_paid"]) ? (bool)$_POST["is_paid"] : false;
+        $sendToWhatsapp = isset($_POST["send_to_whatsapp"]) ? true : false;
+        $sendSMS = isset($_POST["send_sms"]) ? true : false;
+        $smsMessage = isset($_POST["sms_message"]) ? trim($_POST["sms_message"]) : '';
+
+        $patientName = isset($_POST["patient_name"]) ? trim($_POST["patient_name"]) : '';
+        $phone = isset($_POST["phone"]) ? trim($_POST["phone"]) : '';
+        $testDate = isset($_POST["test_date"]) ? $_POST["test_date"] : date('Y-m-d');
+
+        if (empty($patientName) || empty($phone)) {
+            echo json_encode(['status' => 'error', 'message' => '❌ اسم المريض ورقم الهاتف مطلوبان']);
+            exit();
+        }
+
+        $files = $_FILES["pdf_files"];
+        $uploadSuccess = true;
+        $uploadedFiles = [];
+
+        // معالجة الملفات المرفوعة
+        if (isset($files['name']) && is_array($files['name'])) {
+            for ($i = 0; $i < count($files['name']); $i++) {
+                if ($files['error'][$i] !== UPLOAD_ERR_OK) {
+                    $errorMsg = getUploadErrorMsg($files['error'][$i]);
+                    echo json_encode(['status' => 'error', 'message' => '❌ ' . $errorMsg]);
+                    exit();
+                }
+
+                $fileType = strtolower(pathinfo($files["name"][$i], PATHINFO_EXTENSION));
+                if ($fileType !== "pdf") {
+                    echo json_encode(['status' => 'error', 'message' => '❌ الملف يجب أن يكون PDF فقط']);
+                    exit();
+                }
+
+                $newFileName = preg_replace('/\s+/', '_', $patientName) . "_" . time() . "_" . $i . ".pdf";
+                $destination = $uploadDir . $newFileName;
+
+                if (!move_uploaded_file($files["tmp_name"][$i], $destination)) {
+                    $error = error_get_last();
+                    logError("Failed to move uploaded file: " . ($error ? $error['message'] : 'Unknown error'));
+                    echo json_encode(['status' => 'error', 'message' => '❌ فشل في رفع الملف']);
+                    exit();
+                }
+
+                $uploadedFiles[] = [
+                    "date" => $testDate,
+                    "file" => $destination
+                ];
+            }
+        }
+
+        if ($uploadSuccess && !empty($uploadedFiles)) {
+            $foundIndex = null;
+            foreach ($patients as $index => $p) {
+                if ($p["phone"] === $phone) {
+                    $foundIndex = $index;
+                    break;
+                }
+            }
+
+            if ($foundIndex !== null) {
+                // تحديث بيانات المريض
+                $patients[$foundIndex]["name"] = $patientName;
+                $patients[$foundIndex]["is_paid"] = $isPaid;
+                $patients[$foundIndex]["send_to_whatsapp"] = $sendToWhatsapp;
+                $patients[$foundIndex]["send_sms"] = $sendSMS;
+                $patients[$foundIndex]["sms_message"] = $smsMessage;
+                
+                foreach ($uploadedFiles as $file) {
+                    $patients[$foundIndex]["tests"][] = $file;
+                }
+            } else {
+                $patients[] = [
+                    "name" => $patientName,
+                    "phone" => $phone,
+                    "is_paid" => $isPaid,
+                    "send_to_whatsapp" => $sendToWhatsapp,
+                    "send_sms" => $sendSMS,
+                    "sms_message" => $smsMessage,
+                    "tests" => $uploadedFiles,
+                    "added_date" => date('Y-m-d H:i:s') // إضافة تاريخ الإضافة
+                ];
+            }
+
+            if (file_put_contents($dataFile, json_encode($patients, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE))) {
+                $response = ['status' => 'success', 'message' => '✅ تم رفع الملفات وتحديث البيانات'];
+                
+                if ($sendToWhatsapp) {
+                    $whatsappNumber = formatPhoneNumber($phone);
+                    // تغيير رسالة الواتساب هنا إلى النص المطلوب
+                    $message = "السلام عليكم ورحمه الله وبركاته\nتم الانتهاء من التحاليل الطبية الخاصة بكم\nمعمل الايمان يتمنى لكم دوام الصحة والعافية\nيومكم سعيد 🌸🌹🌸";
+                    $whatsappUrl = "https://wa.me/$whatsappNumber?text=" . urlencode($message);
+                    $response['redirect'] = $whatsappUrl;
+                }
+                
+                echo json_encode($response);
+            } else {
+                logError("Failed to save patient data");
+                echo json_encode(['status' => 'error', 'message' => '❌ فشل في حفظ بيانات المريض']);
+            }
+        } else {
+            echo json_encode(['status' => 'error', 'message' => '❌ لم يتم رفع أي ملفات']);
+        }
+        exit();
+    } catch (Exception $e) {
+        logError("Form submission error: " . $e->getMessage());
+        echo json_encode(['status' => 'error', 'message' => '❌ حدث خطأ أثناء معالجة البيانات']);
+        exit();
+    }
+}
+
+// دالة للحصول على رسالة خطأ الرفع
+function getUploadErrorMsg($errorCode) {
+    switch ($errorCode) {
+        case UPLOAD_ERR_INI_SIZE:
+            return 'حجم الملف يتجاوز الحد المسموح به في السيرفر';
+        case UPLOAD_ERR_FORM_SIZE:
+            return 'حجم الملف يتجاوز الحد المسموح به في النموذج';
+        case UPLOAD_ERR_PARTIAL:
+            return 'تم رفع جزء من الملف فقط';
+        case UPLOAD_ERR_NO_FILE:
+            return 'لم يتم رفع أي ملف';
+        case UPLOAD_ERR_NO_TMP_DIR:
+            return 'المجلد المؤقت غير موجود';
+        case UPLOAD_ERR_CANT_WRITE:
+            return 'فشل في كتابة الملف على القرص';
+        case UPLOAD_ERR_EXTENSION:
+            return 'رفع الملف توقف بواسطة إضافة';
+        default:
+            return 'خطأ غير معروف أثناء رفع الملف';
+    }
+}
+
+// تصفية المرضى بناء على استعلام البحث إذا وجد
+$filteredPatients = $patients;
+if (!empty($searchQuery)) {
+    $filteredPatients = array_filter($patients, function($patient) use ($searchQuery) {
+        return stripos($patient['name'], $searchQuery) !== false || 
+               stripos($patient['phone'], $searchQuery) !== false;
+    });
+}
+
+?>
+
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>رفع نتيجة تحليل</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        body {
+            background-color: #f8f9fa;
+            font-family: 'Tajawal', sans-serif;
+        }
+        .header {
+            background: linear-gradient(135deg, #5a1f62 0%, #5a1f62 100%);
+            color: white;
+            padding: 2rem 0;
+            border-radius: 0 0 10px 10px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        .upload-form {
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+            margin-bottom: 2rem;
+        }
+        .results-table {
+            background: white;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+        }
+        .table th {
+            background-color: #f1f7fd;
+            font-weight: 600;
+        }
+        .btn-primary {
+            background-color: #ef71aa;
+            border-color: #ef71aa;
+        }
+        .btn-primary:hover {
+            background-color: #fa4c9a;
+            border-color: #fa4c9a;
+        }
+        .btn-danger {
+            background-color: #dc3545;
+            border-color: #dc3545;
+        }
