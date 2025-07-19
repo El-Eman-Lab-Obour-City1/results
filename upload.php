@@ -10,7 +10,7 @@ function logError($message) {
     file_put_contents($logFile, "[$timestamp] $message\n", FILE_APPEND);
 }
 
-$dataFile = "data.json";
+$dataFile = "https://el-eman-lab-obour-city1.github.io/results/data.json";
 $uploadDir = "uploads/";
 
 // تحميل بيانات المرضى مع معالجة الأخطاء
